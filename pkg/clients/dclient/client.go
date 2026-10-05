@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -155,20 +156,47 @@ func (c *client) GetResource(ctx context.Context, apiVersion string, kind string
 	return c.getResourceInterface(apiVersion, kind, namespace).Get(ctx, name, metav1.GetOptions{}, subresources...)
 }
 
+// maxRawAbsPathResponseBytes bounds how much of a RawAbsPath response is
+// read into memory. Unlike the typed resource clients, RawAbsPath lets a
+// caller hit arbitrary API server paths, including Pod/Service ".../proxy"
+// subresources that stream back whatever an arbitrary backend returns. The
+// underlying rest.Request.DoRaw buffers the entire response in memory with
+// no limit, so a large or slow-to-grow backend response can exhaust the
+// caller's memory. 10 MiB comfortably covers legitimate API responses
+// (including proxied ones) while bounding the worst case.
+const maxRawAbsPathResponseBytes = 10 * 1024 * 1024
+
 func (c *client) RawAbsPath(ctx context.Context, path string, method string, dataReader io.Reader) ([]byte, error) {
 	if c.rest == nil {
 		return c.rawAbsPathForFakeClient(ctx, path, method, dataReader)
 	}
 
+	var req *rest.Request
 	switch method {
 	case "GET":
-		return c.rest.Get().RequestURI(path).DoRaw(ctx)
+		req = c.rest.Get().RequestURI(path)
 	case "POST":
-		return c.rest.Post().Body(dataReader).RequestURI(path).DoRaw(ctx)
-
+		req = c.rest.Post().Body(dataReader).RequestURI(path)
 	default:
 		return nil, fmt.Errorf("method not supported: %s", method)
 	}
+
+	stream, err := req.Stream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer stream.Close()
+
+	// Read one byte past the limit so a response that exactly fills the
+	// limit isn't mistaken for one that was truncated.
+	body, err := io.ReadAll(http.MaxBytesReader(nil, io.NopCloser(stream), maxRawAbsPathResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxRawAbsPathResponseBytes {
+		return nil, fmt.Errorf("response from %s exceeds the maximum allowed size of %d bytes", path, maxRawAbsPathResponseBytes)
+	}
+	return body, nil
 }
 
 // rawAbsPathForFakeClient handles RawAbsPath for fake clients
